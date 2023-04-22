@@ -1,10 +1,15 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"io/ioutil"
+	"os"
+	"sort"
+	"strings"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
@@ -12,6 +17,20 @@ import "hash/fnv"
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int {
+	return len(a)
+}
+
+func (a ByKey) Swap(i int, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a ByKey) Less(i int, j int) bool {
+	return a[i].Key < a[j].Key
 }
 
 //
@@ -24,7 +43,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -34,8 +52,137 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	//CallExample()
+	workerId := os.Getpid()
+	lastTaskId := -1
+	lastTaskType := ""
+	log.Printf("worker[%v] starting....", workerId)
+	for {
+		args := DispatchTaskArgs{
+			WorkerId:     workerId,
+			LastTaskId:   lastTaskId,
+			LastTaskType: lastTaskType,
+		}
+		reply := DispatchTaskReply{}
 
+		ok := call("Coordinator.DispatchTask", &args, &reply)
+
+		if !ok {
+			log.Fatalf("worker[%v] cannot call Coordinator.DispatchTask", workerId)
+		}
+
+		if reply.TaskStage == Map {
+			doMapTask(reply.Filename, workerId, reply.TaskId, reply.NReduce, mapf)
+		} else if reply.TaskStage == Reduce {
+			doReduceTask(reply.Filename, workerId, reply.TaskId, reply.NMap, reducef)
+		} else if reply.TaskStage == Done {
+			break
+		}
+
+		//	if reply.TaskStage == Map || reply.TaskStage == Reduce {
+		lastTaskId = reply.TaskId
+		lastTaskType = reply.TaskStage
+		//}
+	}
+
+}
+
+func tempMapOutFilename(workerId int, taskId int, n int) string {
+	return fmt.Sprintf("temp-mr-%v-%v-%v", workerId, taskId, n)
+}
+
+func mapOutFilename(taskId int, n int) string {
+	return fmt.Sprintf("mr-%v-%v", taskId, n)
+}
+
+func tempReduceOutFilename(workerId int, taskId int) string {
+	return fmt.Sprintf("temp-mr-out-%v-%v", workerId, taskId)
+}
+
+func reduceOutFilename(taskId int) string {
+	return fmt.Sprintf("mr-out-%v", taskId)
+}
+
+func doMapTask(filename string, workerId int, taskId int, nReduce int, mapf func(string, string) []KeyValue) {
+	f, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("worker[%v] cannot open file[%v]", workerId, filename)
+	}
+
+	content, err := ioutil.ReadAll(f)
+
+	kvs := mapf(filename, string(content))
+
+	for i := 0; i < nReduce; i++ {
+		f, err := os.Create(tempMapOutFilename(workerId, taskId, i))
+		//fmt.Printf("%v\n", tempMapOutFilename(workerId, taskId, i))
+		if err != nil {
+			log.Fatalf("worker[%v] cannot create file[%v]", workerId, filename)
+		}
+
+		for _, kv := range kvs {
+			if (ihash(kv.Key) % nReduce) == i {
+				fmt.Fprintf(f, "%v\t%v\n", kv.Key, kv.Value)
+			}
+		}
+		f.Close()
+	}
+}
+
+func doReduceTask(filename string, workerId int, taskId int, nMap int, reducef func(string, []string) string) {
+	var lines []string
+
+	for i := 0; i < nMap; i++ {
+		mapOutFile := mapOutFilename(i, taskId)
+		f, err := os.Open(mapOutFile)
+		if err != nil {
+			log.Fatalf("worker[%v] cannot open file[%v]", workerId, mapOutFile)
+		}
+
+		content, err := ioutil.ReadAll(f)
+		f.Close()
+		if err != nil {
+			log.Fatalf("worker[%v] cannot read file[%v]", workerId, mapOutFile)
+		}
+
+		lines = append(lines, strings.Split(string(content), "\n")...)
+	}
+
+	var kvs []KeyValue
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		split := strings.Split(line, "\t")
+		kvs = append(kvs, KeyValue{split[0], split[1]})
+	}
+
+	sort.Sort(ByKey(kvs))
+
+	f, err := os.Create(tempReduceOutFilename(workerId, taskId))
+	//	fmt.Printf("%v\n", tempReduceOutFilename(workerId, taskId))
+	if err != nil {
+		log.Fatalf("worker[%v] cannot create file[%v]", tempReduceOutFilename(workerId, taskId))
+	}
+
+	for i := 0; i < len(kvs); {
+		var values []string
+		values = append(values, kvs[i].Value)
+
+		j := i + 1
+		for ; j < len(kvs); j++ {
+			if kvs[j].Key != kvs[i].Key {
+				break
+			}
+			values = append(values, kvs[j].Value)
+		}
+
+		ret := reducef(kvs[i].Key, values)
+		fmt.Fprintf(f, "%v %v\n", kvs[i].Key, ret)
+
+		i = j
+	}
+	f.Close()
 }
 
 //
